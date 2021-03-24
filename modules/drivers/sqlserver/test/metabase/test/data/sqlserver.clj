@@ -1,10 +1,14 @@
 (ns metabase.test.data.sqlserver
   "Code for creating / destroying a SQLServer database from a `DatabaseDefinition`."
   (:require [clojure.java.jdbc :as jdbc]
+            [clojure.tools.logging :as log]
             [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
+            [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
             [metabase.test.data.interface :as tx]
             [metabase.test.data.sql :as sql.tx]
-            [metabase.test.data.sql-jdbc :as sql-jdbc.tx]))
+            [metabase.test.data.sql-jdbc :as sql-jdbc.tx]
+            [metabase.util.i18n :refer [trs]])
+  (:import (java.sql Connection ResultSet)))
 
 (sql-jdbc.tx/add-test-extensions! :sqlserver)
 
@@ -73,3 +77,42 @@
     ((get-method tx/aggregate-column-info ::tx/test-extensions) driver ag-type field)
     (when (#{:count :cum-count} ag-type)
       {:base_type :type/Integer}))))
+
+;; SQL server only supports setting holdability at the connection level, not the statement level, as per
+;; https://docs.microsoft.com/en-us/sql/connect/jdbc/using-holdability?view=sql-server-ver15
+;; and
+;; https://github.com/microsoft/mssql-jdbc/blob/v9.2.1/src/main/java/com/microsoft/sqlserver/jdbc/SQLServerConnection.java#L5349-L5357
+;; an exception is thrown if they do not match, so it's safer to simply NOT try to override it at the statement level,
+;; because it's not supported anyway
+(defmethod sql-jdbc.execute/prepared-statement :sqlserver
+  [driver ^Connection conn ^String sql params]
+  (let [stmt (.prepareStatement conn
+                                sql
+                                ResultSet/TYPE_FORWARD_ONLY
+                                ResultSet/CONCUR_READ_ONLY)]
+    (try
+      (try
+        (.setFetchDirection stmt ResultSet/FETCH_FORWARD)
+        (catch Throwable e
+          (log/debug e (trs "Error setting prepared statement fetch direction to FETCH_FORWARD"))))
+      (sql-jdbc.execute/set-parameters! driver stmt params)
+      stmt
+      (catch Throwable e
+        (.close stmt)
+        (throw e)))))
+
+;; similar rationale to prepared-statement above
+(defmethod sql-jdbc.execute/statement :sqlserver
+  [_ ^Connection conn]
+  (let [stmt (.createStatement conn
+                               ResultSet/TYPE_FORWARD_ONLY
+                               ResultSet/CONCUR_READ_ONLY)]
+    (try
+      (try
+        (.setFetchDirection stmt ResultSet/FETCH_FORWARD)
+        (catch Throwable e
+          (log/debug e (trs "Error setting statement fetch direction to FETCH_FORWARD"))))
+      stmt
+      (catch Throwable e
+        (.close stmt)
+        (throw e)))))
